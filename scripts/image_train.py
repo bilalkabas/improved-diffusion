@@ -31,10 +31,33 @@ def main():
 
     logger.log("creating data loader...")
     data = load_data(
-        data_dir=args.data_dir,
+        dataset_dir=args.data_dir,
+        stage='train',
+        source_modality=args.source_modality,
+        target_modality=args.target_modality,
         batch_size=args.batch_size,
-        image_size=args.image_size,
-        class_cond=args.class_cond,
+        shuffle=True,
+        device=dist_util.dev()
+    )
+
+    val_data = load_data(
+        dataset_dir=args.data_dir,
+        stage='val',
+        source_modality=args.source_modality,
+        target_modality=args.target_modality,
+        batch_size=args.batch_size,
+        shuffle=False,
+        device=dist_util.dev()
+    )
+
+    test_data = load_data(
+        dataset_dir=args.data_dir,
+        stage='test',
+        source_modality=args.source_modality,
+        target_modality=args.target_modality,
+        batch_size=args.batch_size,
+        shuffle=False,
+        device=dist_util.dev()
     )
 
     logger.log("training...")
@@ -42,6 +65,9 @@ def main():
         model=model,
         diffusion=diffusion,
         data=data,
+        val_data=val_data,
+        test_data=test_data,
+        n_epoch=args.n_epoch,
         batch_size=args.batch_size,
         microbatch=args.microbatch,
         lr=args.lr,
@@ -61,18 +87,22 @@ def create_argparser():
     defaults = dict(
         data_dir="",
         schedule_sampler="uniform",
+        n_epoch=50,
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
         batch_size=1,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
-        log_interval=10,
-        save_interval=10000,
+        log_interval=1,
+        save_interval=1,
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
+        source_modality=None,
+        target_modality=None
     )
+    
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)

@@ -257,7 +257,13 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        model_output = model(x, self._scale_timesteps(t), **model_kwargs)
+
+        # If model_kwargs has source key, concatenate it to x.
+        inp = x
+        if "source" in model_kwargs:
+            inp = th.cat([x, model_kwargs["source"]], dim=1)
+
+        model_output = model(inp, self._scale_timesteps(t), **model_kwargs)
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -707,7 +713,12 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+            # If model_kwargs has source key, concatenate it to x_t.
+            inp = x_t
+            if "source" in model_kwargs:
+                inp = th.cat([x_t, model_kwargs["source"]], dim=1)
+
+            model_output = model(inp, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,

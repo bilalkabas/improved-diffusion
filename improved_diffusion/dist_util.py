@@ -45,6 +45,11 @@ def dev():
     """
     Get the device to use for torch.distributed.
     """
+    manual_rank = os.getenv("MANUAL_RANK")
+
+    if manual_rank is not None:
+        return th.device(f"cuda:{int(manual_rank) % GPUS_PER_NODE}")
+
     if th.cuda.is_available():
         return th.device(f"cuda:{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}")
     return th.device("cpu")

@@ -1,6 +1,7 @@
 import copy
 import functools
 import os
+from tqdm import tqdm
 
 import blobfile as bf
 import numpy as np
@@ -8,6 +9,8 @@ import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
+
+import matplotlib.pyplot as plt
 
 from . import dist_util, logger
 from .fp16_util import (
@@ -33,6 +36,9 @@ class TrainLoop:
         model,
         diffusion,
         data,
+        val_data,
+        test_data,
+        n_epoch,
         batch_size,
         microbatch,
         lr,
@@ -45,10 +51,14 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        clip_denoised=True,
     ):
         self.model = model
         self.diffusion = diffusion
         self.data = data
+        self.val_data = val_data
+        self.test_data = test_data
+        self.n_epoch = n_epoch
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -65,6 +75,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.clip_denoised = clip_denoised
 
         self.step = 0
         self.resume_step = 0
@@ -158,41 +169,97 @@ class TrainLoop:
         self.master_params = make_master_params(self.model_params)
         self.model.convert_to_fp16()
 
+    def evaluate(self, target, source):
+        if self.model.training:
+            self.model.eval()
+            set_training_mode = True
+        
+        with th.no_grad():
+            model_kwargs = {}
+            model_kwargs["source"] = source
+
+            sample = self.diffusion.p_sample_loop(
+                self.model,
+                target.shape,
+                clip_denoised=self.clip_denoised,
+                model_kwargs=model_kwargs,
+                progress=True
+            )
+
+            # Convert to 8-bit image
+            sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            sample = sample.permute(0, 2, 3, 1)
+            sample = sample.contiguous()
+        
+        if set_training_mode:
+            self.model.train()
+
+        return sample
+
     def run_loop(self):
-        while (
-            not self.lr_anneal_steps
-            or self.step + self.resume_step < self.lr_anneal_steps
-        ):
-            batch, cond = next(self.data)
-            self.run_step(batch, cond)
-            if self.step % self.log_interval == 0:
+        for self.epoch in range(1, self.n_epoch+1):
+            for batch, batch_image_cond in tqdm(self.data, desc=f"Epoch {self.epoch}/{self.n_epoch}", total=len(self.data)):
+                self.run_step(batch, batch_image_cond)
+                self.step += 1
+            
+            if self.epoch % self.log_interval == 0:
                 logger.dumpkvs()
-            if self.step % self.save_interval == 0:
+                
+            if self.epoch % self.save_interval == 0:
                 self.save()
+                
+                print("validation...")
+                for batch, batch_image_cond in self.val_data:
+                    sample = self.evaluate(batch, batch_image_cond)
+
+                    for i, (gt, pred) in enumerate(zip(batch, sample)):
+                        plt.subplot(1, 2, 1)
+                        plt.imshow(gt.permute(1, 2, 0).cpu().numpy(), cmap="gray")
+                        plt.title("Original")
+                        plt.axis("off")
+
+                        plt.subplot(1, 2, 2)
+                        plt.imshow(pred.cpu().numpy(), cmap="gray")
+                        plt.title("Predicted")
+                        plt.axis("off")
+
+                        save_path = os.path.join(logger.get_dir(), f"sample_epoch_{self.epoch}_{i}.png")
+                        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+                    
+                    break
+
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
-            self.step += 1
+                
         # Save the last checkpoint if it wasn't already saved.
-        if (self.step - 1) % self.save_interval != 0:
+        if (self.epoch - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
+        # Run test at the end of training
+        print("testing...")
+        test_samples = []
+        for batch, batch_image_cond in tqdm(self.test_data):
+            sample = self.evaluate(batch, batch_image_cond)
+            test_samples.append(sample.cpu().numpy())
+
+        test_samples = np.array(test_samples)
+        np.save(os.path.join(logger.get_dir(), "test_samples.npy"), test_samples)
+
+    def run_step(self, batch, batch_image_cond):
+        self.forward_backward(batch, batch_image_cond)
         if self.use_fp16:
             self.optimize_fp16()
         else:
             self.optimize_normal()
         self.log_step()
 
-    def forward_backward(self, batch, cond):
+    def forward_backward(self, batch, batch_image_cond):
         zero_grad(self.model_params)
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
-                for k, v in cond.items()
-            }
+            micro_image_cond = batch_image_cond[i : i + self.microbatch].to(dist_util.dev())
+
             last_batch = (i + self.microbatch) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
@@ -201,7 +268,7 @@ class TrainLoop:
                 self.ddp_model,
                 micro,
                 t,
-                model_kwargs=micro_cond,
+                model_kwargs={"source": micro_image_cond}
             )
 
             if last_batch or not self.use_ddp:
@@ -263,6 +330,7 @@ class TrainLoop:
             param_group["lr"] = lr
 
     def log_step(self):
+        logger.logkv("epoch", self.epoch)
         logger.logkv("step", self.step + self.resume_step)
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
         if self.use_fp16:
@@ -274,9 +342,9 @@ class TrainLoop:
             if dist.get_rank() == 0:
                 logger.log(f"saving model {rate}...")
                 if not rate:
-                    filename = f"model{(self.step+self.resume_step):06d}.pt"
+                    filename = f"model{(self.epoch+self.resume_step):06d}.pt"
                 else:
-                    filename = f"ema_{rate}_{(self.step+self.resume_step):06d}.pt"
+                    filename = f"ema_{rate}_{(self.epoch+self.resume_step):06d}.pt"
                 with bf.BlobFile(bf.join(get_blob_logdir(), filename), "wb") as f:
                     th.save(state_dict, f)
 
@@ -286,7 +354,7 @@ class TrainLoop:
 
         if dist.get_rank() == 0:
             with bf.BlobFile(
-                bf.join(get_blob_logdir(), f"opt{(self.step+self.resume_step):06d}.pt"),
+                bf.join(get_blob_logdir(), f"opt{(self.epoch+self.resume_step):06d}.pt"),
                 "wb",
             ) as f:
                 th.save(self.opt.state_dict(), f)
