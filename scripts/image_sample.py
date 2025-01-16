@@ -47,7 +47,8 @@ def main():
         source_modality=args.source_modality,
         target_modality=args.target_modality,
         batch_size=args.batch_size,
-        device=dist_util.dev()
+        device=dist_util.dev(),
+        shuffle=False
     )
 
     all_images = []
@@ -93,7 +94,7 @@ def create_argparser():
         batch_size=4,
         use_ddim=False,
         model_path="",
-        dataset_dir="",
+        data_dir="",
         source_modality=None,
         target_modality=None
     )
